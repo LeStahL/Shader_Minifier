@@ -8,6 +8,7 @@ type private ParseImpl(options: Options.Options) =
 
     let mutable forbiddenNames = []
     let mutable reorderFunctions = false
+    let mutable knownTypes = Set.empty<string>
 
     let commentLine = parse {
         do! skipString "//" // .>> noneOf "[")) // (pchar '[')) // <?> "comment, not verbatim code"
@@ -149,7 +150,9 @@ type private ParseImpl(options: Options.Options) =
         // same precedence as =
         opp.AddOperator(TernaryOperator("?", ws, ":", ws, precCounter, Associativity.Right, fun x y z -> Ast.FunCall(Ast.Op "?:", [x; y; z])))
 
-    let simpleStatement = opt expr |>> (function Some exp -> Ast.Expr exp | None -> Ast.Block [])
+    let simpleStatement =
+        expr |>> Ast.Expr
+
     let statement, stmtRef = createParserForwardedToRef()
     let declaration, declRef = createParserForwardedToRef()
     let pfunction, pfunctionRef = createParserForwardedToRef()
@@ -184,11 +187,16 @@ type private ParseImpl(options: Options.Options) =
                 let blockType = if prefix = "struct" then Ast.Struct else Ast.InterfaceBlock prefix
                 { blockType = blockType; name = n; template = t; baseClass = c; members = m }: Ast.StructOrInterfaceBlock)
 
-    let structSpecifier = parse {
-        let! str = keyword "struct"
-        let! res = blockSpecifier str
-        return res
-    }
+    let structSpecifier =
+        pipe2 (keyword "struct") (blockSpecifier "struct")
+            (fun _ res ->
+                match res.name with
+                | Some name ->
+                    knownTypes <- knownTypes.Add name.Name
+                | None -> ()
+
+                res)
+
 
     let structDecl =
         let semi = if options.hlsl then opt (ch ';') |>> ignore<unit option> else ch ';'
@@ -207,11 +215,39 @@ type private ParseImpl(options: Options.Options) =
     let glslLayout = keyword "layout" >>. ch '(' >>. manyCharsTill anyChar (ch ')')
                       |>> (function s -> "layout(" + s + ")")
     let glslQualifier = many (glslStorage <|> glslLayout)
+    let builtinTypes =
+        Set.ofList [
+            "void"
+            "bool"; "int"; "uint"; "float"; "double"
+            "bvec2"; "bvec3"; "bvec4"
+            "ivec2"; "ivec3"; "ivec4"
+            "uvec2"; "uvec3"; "uvec4"
+            "vec2"; "vec3"; "vec4"
+            "dvec2"; "dvec3"; "dvec4"
+            "mat2"; "mat3"; "mat4"
+            "mat2x2"; "mat2x3"; "mat2x4"
+            "mat3x2"; "mat3x3"; "mat3x4"
+            "mat4x2"; "mat4x3"; "mat4x4"
+            "sampler2D"; "samplerCube"
+        ]
+
     let specifiedTypeGLSL =
-        let typeSpec = (structSpecifier |>> Ast.TypeBlock) <|> (ident |>> Ast.TypeName)
-        // e.g. `float[3]`, or `int[]` for an unsized array
-        let arraySizes = many (between (ch '[') (ch ']') (opt expr))
-        pipe3 glslQualifier typeSpec arraySizes (fun tyQ name sizes -> Ast.makeType name tyQ sizes)
+        let typeName =
+            ident >>= fun id ->
+                if knownTypes.Contains id.Name || builtinTypes.Contains id.Name then
+                    preturn (Ast.TypeName id)
+                else
+                    fail "Unknown type"
+
+        let typeSpec =
+            (structSpecifier |>> Ast.TypeBlock) <|> typeName
+
+        let arraySizes =
+            many (between (ch '[') (ch ']') (opt expr))
+
+        pipe3 glslQualifier typeSpec arraySizes
+            (fun tyQ name sizes -> Ast.makeType name tyQ sizes)
+
 
     let hlslStorage = ["extern"; "nointerpolation"; "precise"; "shared"; "groupshared"
                        "static"; "uniform"; "volatile"; "const"; "row_major"; "column_major"
@@ -353,21 +389,41 @@ type private ParseImpl(options: Options.Options) =
         let ret = pipe2 (keyword "return") (opt expr) (fun k e -> Ast.Jump(Ast.JumpKeyword.fromString k, e))
         (key <|> ret) .>> ch ';'
 
+    let declarationOrStatement =
+        // Reject declarations where a comma immediately follows the type.
+        let invalidLeadingComma =
+            specifiedType .>> ch ',' >>. fail "Unexpected comma after type name"
+
+        let declarationParser =
+            attempt (declaration .>> ch ';') |>> Ast.Decl
+
+        let expressionParser =
+            simpleStatement .>> ch ';'
+
+        choice [
+            invalidLeadingComma
+            declarationParser
+            expressionParser
+        ]
+
     // A statement
-    do stmtRef.Value <- choice [
-        template |>> Ast.Verbatim
-        block
-        jump
-        forLoop
-        ifStatement
-        whileLoop
-        doWhileLoop
-        switch
-        verbatim |>> Ast.Verbatim
-        macro |>> Ast.Directive
-        attribute |>> Ast.Verbatim
-        attempt ((declaration .>> ch ';') |>> Ast.Decl)
-        simpleStatement .>> ch ';'] <?> "statement"
+    do
+        stmtRef.Value <-
+            (choice [
+                template |>> Ast.Verbatim
+                block
+                jump
+                forLoop
+                ifStatement
+                whileLoop
+                doWhileLoop
+                switch
+                verbatim |>> Ast.Verbatim
+                macro |>> Ast.Directive
+                attribute |>> Ast.Verbatim
+                declarationOrStatement
+            ]) <?> "statement"
+
 
     // e.g. "int foo(float a[], out int b) : color"
     let functionHeader =
@@ -412,6 +468,7 @@ type private ParseImpl(options: Options.Options) =
     member _.runParser streamName content : Ast.Shader =
         forbiddenNames <- [ "if"; "in"; "do" ]
         reorderFunctions <- false
+        knownTypes <- Set.empty
         let content =
             if options.preprocess then Preprocessor.preprocess options streamName content else content
         let res = runParserOnString parse () streamName content
