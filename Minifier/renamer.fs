@@ -42,6 +42,8 @@ type private Env = {
     newName: Namespace -> Env -> Ident -> Env
     // Function called when we enter a scope, to support name reuse via shadowing
     onEnterScope: Env -> Stmt -> Env
+    // We need to track structs to burn their ids.
+    structNames: Set<string>
 }
 with
     static member Create(availableNames, availableFieldNames, allowOverloading, newName, onEnterScope) = {
@@ -54,6 +56,7 @@ with
         allowOverloading = allowOverloading
         newName = newName
         onEnterScope = onEnterScope
+        structNames = Set.empty
     }
 
     // Renames the identifier and move its new name from availableNames to identRenames.
@@ -114,12 +117,12 @@ type private RenamerVisitor(options: Options.Options, funSignatures: Map<string,
         options.visitor(mapper).iterExpr expr
 
     let renNamedStruct (env: Env) (structName: Ident) =
-        // top level struct declaration, e.g. `struct foo { int a; float b; }`
-        if options.noRenamingList |> List.contains structName.Name then
-            env.DontRename structName
-        else
-            let env = env.newName VarFunStruct env structName
-            env
+        let env =
+            if options.noRenamingList |> List.contains structName.Name then
+                env.DontRename structName
+            else
+                env.newName VarFunStruct env structName
+        { env with structNames = env.structNames.Add(structName.Name) }
 
     let rec renDecl (context: DeclarationContext) (envForType: Env option) env (ty:Type, vars) =
         let renDeclElt (env: Env) (decl: DeclElt) =
@@ -505,7 +508,8 @@ type private RenamerImpl(options: Options.Options) =
                                 // between AST locations as a result of multi-use-site inlining. And that is a use that prevents shadowing!
                                 name
                       ) |> set
-        let identRenames, reusable = env.identRenames |> Map.partition (fun _ id -> stillUsedSet.Contains id)
+        // Avoid resuing struct names.
+        let identRenames, reusable = env.identRenames |> Map.partition (fun _ id -> stillUsedSet.Contains id || env.structNames.Contains id)
         // Only reuse names that were picked by the renamer. Names that were kept as-is (e.g. with
         // --preserve-all-globals or --no-renaming-list) must not be given to other identifiers.
         let reusable = [for KeyValue(oldName, newName) in reusable do if oldName <> newName then newName]
